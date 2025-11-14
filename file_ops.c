@@ -1,13 +1,243 @@
 #include "file_ops.h"
 #include <time.h>
+#include <pthread.h> // 导入 POSIX 线程库
+
+// =============================================================================
+// 全局文件系统锁
+// 
+// 这是实现多线程安全的关键。任何对文件系统元数据（位图、inode、目录块）
+// 或磁盘文件（disk.img）的读写操作都必须先获取这个锁。
+// =============================================================================
+pthread_mutex_t fs_lock;
 
 // 计算每个块可以容纳多少个inode
 #define INODES_PER_BLOCK (BLOCK_SIZE / sizeof(inode_t))
+
+// =============================================================================
+// 内部辅助函数 (无锁)
+// 
+// 这些函数以 `_` 开头，它们执行实际的文件系统逻辑，但 *不* 包含
+// 任何互斥锁（mutex）操作。它们假设调用者（如 copy_file, create_file）
+// 已经获取了 `fs_lock`。
+// 这可以防止死锁（一个已持锁的函数试图再次获取同一个锁）。
+// =============================================================================
+
+/**
+ * [内部] 查找文件并返回其inode编号。
+ * 成功返回inode编号，失败返回-1。
+ */
+int _find_file_inode(const char* filename, inode_t* root_inode) {
+    char root_data[BLOCK_SIZE];
+    disk_read_block(root_inode->blocks[0], root_data);
+    
+    dir_entry_t* entries = (dir_entry_t*)root_data;
+    int entry_count = BLOCK_SIZE / sizeof(dir_entry_t);
+    
+    for (int i = 0; i < entry_count; i++) {
+        if (entries[i].inode != 0 && strcmp(entries[i].name, filename) == 0) {
+            return entries[i].inode;
+        }
+    }
+    return -1; // 未找到
+}
+
+/**
+ * [内部] 根据inode编号读取inode结构。
+ * 成功返回0并填充inode_out，失败返回-1。
+ */
+int _read_inode(int inode_num, inode_t* inode_out) {
+    if (inode_num < 0 || inode_num >= MAX_FILES) {
+        return -1;
+    }
+    
+    int inode_block_index = inode_num / INODES_PER_BLOCK;
+    int inode_offset = inode_num % INODES_PER_BLOCK;
+    
+    char inode_block[BLOCK_SIZE];
+    disk_read_block(INODE_START_BLOCK + inode_block_index, inode_block);
+    
+    inode_t* inodes = (inode_t*)inode_block;
+    *inode_out = inodes[inode_offset];
+    
+    return 0;
+}
+
+/**
+ * [内部] 根据inode编号写入inode结构。
+ * 成功返回0，失败返回-1。
+ */
+int _write_inode(int inode_num, inode_t* inode_in) {
+    if (inode_num < 0 || inode_num >= MAX_FILES) {
+        return -1;
+    }
+
+    int inode_block_index = inode_num / INODES_PER_BLOCK;
+    int inode_offset = inode_num % INODES_PER_BLOCK;
+
+    char inode_block[BLOCK_SIZE];
+    // 先读取包含目标inode的整个块
+    disk_read_block(INODE_START_BLOCK + inode_block_index, inode_block);
+
+    // 更新该块中的特定inode
+    inode_t* inodes = (inode_t*)inode_block;
+    inodes[inode_offset] = *inode_in;
+
+    // 将修改后的整个块写回磁盘
+    disk_write_block(INODE_START_BLOCK + inode_block_index, inode_block);
+
+    return 0;
+}
+
+
+/**
+ * [内部] 创建文件逻辑 (无锁)
+ */
+int _create_file(const char* filename, inode_t* root_inode) {
+    char root_data[BLOCK_SIZE];
+    disk_read_block(root_inode->blocks[0], root_data);
+    
+    dir_entry_t* entries = (dir_entry_t*)root_data;
+    int entry_count = BLOCK_SIZE / sizeof(dir_entry_t);
+    int free_slot = -1;
+    
+    // 查找同名文件或空槽位
+    for (int i = 0; i < entry_count; i++) {
+        if (entries[i].inode != 0) {
+            if (strcmp(entries[i].name, filename) == 0) {
+                printf("错误: 文件 '%s' 已存在\n", filename);
+                return -1;
+            }
+        } else if (free_slot == -1) {
+            free_slot = i;
+        }
+    }
+    
+    if (free_slot == -1) {
+        printf("错误: 目录已满\n");
+        return -1;
+    }
+    
+    // 分配inode
+    int inode_num = alloc_inode();
+    if (inode_num < 0) {
+        printf("错误: 没有可用的inode\n");
+        return -1;
+    }
+    
+    // 初始化inode
+    inode_t new_inode = {0};
+    new_inode.type = 1; // 普通文件
+    new_inode.links = 1;
+    new_inode.size = 0;
+    
+    // 写入inode
+    _write_inode(inode_num, &new_inode);
+    
+    // 更新目录项
+    entries[free_slot].inode = inode_num;
+    strncpy(entries[free_slot].name, filename, MAX_FILENAME - 1);
+    entries[free_slot].name[MAX_FILENAME - 1] = '\0';
+    
+    // 写回根目录数据块
+    disk_write_block(root_inode->blocks[0], root_data);
+    
+    printf("文件 '%s' 创建成功\n", filename);
+    return 0; // 返回成功
+}
+
+/**
+ * [内部] 读取文件逻辑 (无锁)
+ */
+int _read_file(int inode_num, inode_t* file_inode, char* buffer, size_t size) {
+    if (file_inode->type != 1) {
+        return -1; // 不是文件
+    }
+
+    size_t bytes_to_read = (size < file_inode->size) ? size : file_inode->size;
+    size_t bytes_read = 0;
+    
+    for (int i = 0; i < 8 && bytes_read < bytes_to_read && file_inode->blocks[i] != 0; i++) {
+        char block_data[BLOCK_SIZE];
+        disk_read_block(file_inode->blocks[i], block_data);
+        
+        size_t block_bytes = (bytes_to_read - bytes_read < BLOCK_SIZE) ? (bytes_to_read - bytes_read) : BLOCK_SIZE;
+        memcpy(buffer + bytes_read, block_data, block_bytes);
+        bytes_read += block_bytes;
+    }
+    
+    return bytes_read;
+}
+
+/**
+ * [内部] 写入文件逻辑 (无锁)
+ */
+int _write_file(int inode_num, inode_t* file_inode, const char* buffer, size_t size) {
+    if (file_inode->type != 1) {
+        return -1; // 不是文件
+    }
+
+    // 释放原有数据块
+    for (int i = 0; i < 8 && file_inode->blocks[i] != 0; i++) {
+        free_block(file_inode->blocks[i]);
+        file_inode->blocks[i] = 0;
+    }
+    
+    // 写入文件内容
+    size_t bytes_written = 0;
+    int block_index = 0;
+    
+    while (bytes_written < size && block_index < 8) {
+        // 分配新的数据块
+        int new_block = alloc_block();
+        if (new_block < 0) {
+            printf("错误: 磁盘空间不足\n");
+            break;
+        }
+        file_inode->blocks[block_index] = new_block;
+        
+        // 准备要写入的数据块
+        char block_data[BLOCK_SIZE] = {0};
+        size_t block_bytes = (size - bytes_written < BLOCK_SIZE) ? (size - bytes_written) : BLOCK_SIZE;
+        memcpy(block_data, buffer + bytes_written, block_bytes);
+        
+        // 写入数据块
+        disk_write_block(file_inode->blocks[block_index], block_data);
+        
+        bytes_written += block_bytes;
+        block_index++;
+    }
+    
+    // 更新文件大小
+    file_inode->size = bytes_written;
+    
+    // 写回inode
+    _write_inode(inode_num, file_inode);
+    
+    return bytes_written;
+}
+
+
+// =============================================================================
+// 公共API函数 (带锁)
+// 
+// 这些是暴露给外部（如 main.c）的函数。
+// 它们负责获取和释放 `fs_lock`，以确保线程安全。
+// =============================================================================
+
+/**
+ * 初始化文件系统锁
+ * (这个函数应该在 main.c 中，在创建任何线程之前被调用)
+ */
+void init_fs_lock() {
+    pthread_mutex_init(&fs_lock, NULL);
+}
 
 /**
  * 格式化磁盘
  */
 int format_disk() {
+    pthread_mutex_lock(&fs_lock);
+    
     // 初始化超级块
     memset(&fs.superblock, 0, sizeof(superblock_t));
     fs.superblock.magic = 0x12345678;
@@ -41,16 +271,16 @@ int format_disk() {
     root_inode.links = 1;
     root_inode.blocks[0] = DATA_START_BLOCK; // 根目录数据块
     
-    // 写入根目录inode (根目录inode编号为0，位于第0个inode块的第0个inode)
-    char inode_block[BLOCK_SIZE] = {0};
-    memcpy(inode_block, &root_inode, sizeof(inode_t));
-    disk_write_block(INODE_START_BLOCK, inode_block);
+    // 写入根目录inode (根目录inode编号为0)
+    _write_inode(0, &root_inode);
     
     // 初始化根目录数据块（空目录）
     char root_data[BLOCK_SIZE] = {0};
     disk_write_block(DATA_START_BLOCK, root_data);
     
     printf("磁盘格式化完成\n");
+    
+    pthread_mutex_unlock(&fs_lock);
     return 0;
 }
 
@@ -58,8 +288,10 @@ int format_disk() {
  * 显示磁盘信息
  */
 int show_disk_info() {
+    pthread_mutex_lock(&fs_lock);
+    
     printf("\n磁盘信息:\n");
-    printf("  魔数: 0x%x\n", fs.superblock.magic);
+    printf("  文件系统类型: SimpleFS v1.0\n");
     printf("  总块数: %u\n", fs.superblock.blocks);
     printf("  Inode区块数: %u\n", fs.superblock.inode_blocks);
     printf("  数据区块数: %u\n", fs.superblock.data_blocks);
@@ -67,11 +299,13 @@ int show_disk_info() {
     printf("  空闲数据块数: %u\n", fs.superblock.free_data_count);
     printf("  文件系统状态: %s\n", fs.superblock.state ? "已挂载" : "未挂载");
     printf("\n");
+    
+    pthread_mutex_unlock(&fs_lock);
     return 0;
 }
 
 /**
- * 分配一个inode
+ * 分配一个inode (无锁 - 被更高层级的带锁函数调用)
  */
 int alloc_inode() {
     if (fs.superblock.free_inode_count <= 0) {
@@ -95,7 +329,7 @@ int alloc_inode() {
 }
 
 /**
- * 释放一个inode
+ * 释放一个inode (无锁 - 被更高层级的带锁函数调用)
  */
 void free_inode(int inode_num) {
     if (inode_num < 0 || inode_num >= MAX_FILES) {
@@ -111,7 +345,7 @@ void free_inode(int inode_num) {
 }
 
 /**
- * 分配一个数据块
+ * 分配一个数据块 (无锁 - 被更高层级的带锁函数调用)
  */
 int alloc_block() {
     if (fs.superblock.free_data_count <= 0) {
@@ -135,7 +369,7 @@ int alloc_block() {
 }
 
 /**
- * 释放一个数据块
+ * 释放一个数据块 (无锁 - 被更高层级的带锁函数调用)
  */
 void free_block(int block_num) {
     if (block_num < DATA_START_BLOCK || block_num >= DISK_BLOCKS) {
@@ -152,152 +386,83 @@ void free_block(int block_num) {
 }
 
 /**
- * 创建文件
+ * 创建文件 (带锁)
  */
 int create_file(const char* filename) {
-    // 查找根目录中是否已存在同名文件
+    pthread_mutex_lock(&fs_lock);
+    
+    // 1. 读取根目录inode
     inode_t root_inode;
-    disk_read_block(INODE_START_BLOCK, &root_inode);
+    _read_inode(0, &root_inode); // 根目录总是inode 0
     
-    char root_data[BLOCK_SIZE];
-    disk_read_block(root_inode.blocks[0], root_data);
+    // 2. 调用无锁的内部函数
+    int result = _create_file(filename, &root_inode);
     
-    dir_entry_t* entries = (dir_entry_t*)root_data;
-    int entry_count = BLOCK_SIZE / sizeof(dir_entry_t);
-    int free_slot = -1;
-    
-    // 查找同名文件或空槽位
-    for (int i = 0; i < entry_count; i++) {
-        if (entries[i].inode != 0) {
-            // 检查是否已存在同名文件
-            if (strcmp(entries[i].name, filename) == 0) {
-                printf("错误: 文件 '%s' 已存在\n", filename);
-                return -1;
-            }
-        } else if (free_slot == -1) {
-            // 记录第一个空槽位
-            free_slot = i;
-        }
-    }
-    
-    // 如果没有找到空槽位，再次完整遍历确认
-    if (free_slot == -1) {
-        for (int i = 0; i < entry_count; i++) {
-            if (entries[i].inode == 0) {
-                free_slot = i;
-                break;
-            }
-        }
-    }
-    
-    // 如果仍然没有找到空槽位，说明目录确实已满
-    if (free_slot == -1) {
-        printf("错误: 目录已满\n");
-        return -1;
-    }
-    
-    // 分配inode
-    int inode_num = alloc_inode();
-    if (inode_num < 0) {
-        printf("错误: 没有可用的inode\n");
-        return -1;
-    }
-    
-    // 初始化inode
-    inode_t new_inode = {0};
-    new_inode.type = 1; // 普通文件
-    new_inode.links = 1;
-    new_inode.size = 0;
-    
-    // 计算inode所在的块和在块内的偏移
-    int inode_block_index = inode_num / INODES_PER_BLOCK;
-    int inode_offset = inode_num % INODES_PER_BLOCK;
-    
-    // 读取inode所在的块
-    char inode_block[BLOCK_SIZE];
-    disk_read_block(INODE_START_BLOCK + inode_block_index, inode_block);
-    
-    // 更新inode
-    inode_t* inodes = (inode_t*)inode_block;
-    inodes[inode_offset] = new_inode;
-    
-    // 写入inode块
-    disk_write_block(INODE_START_BLOCK + inode_block_index, inode_block);
-    
-    // 更新目录项
-    entries[free_slot].inode = inode_num;
-    strncpy(entries[free_slot].name, filename, MAX_FILENAME - 1);
-    entries[free_slot].name[MAX_FILENAME - 1] = '\0';
-    
-    // 写回根目录数据块
-    disk_write_block(root_inode.blocks[0], root_data);
-    
-    printf("文件 '%s' 创建成功\n", filename);
-    return 0;
+    pthread_mutex_unlock(&fs_lock);
+    return result;
 }
 
 /**
- * 删除文件
+ * 删除文件 (带锁)
  */
 int delete_file(const char* filename) {
-    // 查找根目录中的文件
+    pthread_mutex_lock(&fs_lock);
+    
+    // 1. 读取根目录inode
     inode_t root_inode;
-    disk_read_block(INODE_START_BLOCK, &root_inode);
+    _read_inode(0, &root_inode);
     
-    char root_data[BLOCK_SIZE];
-    disk_read_block(root_inode.blocks[0], root_data);
-    
-    dir_entry_t* entries = (dir_entry_t*)root_data;
-    int entry_count = BLOCK_SIZE / sizeof(dir_entry_t);
-    int file_index = -1;
-    
-    for (int i = 0; i < entry_count; i++) {
-        if (entries[i].inode != 0 && strcmp(entries[i].name, filename) == 0) {
-            file_index = i;
-            break;
-        }
-    }
-    
-    if (file_index == -1) {
+    // 2. 查找文件inode编号
+    int inode_num = _find_file_inode(filename, &root_inode);
+    if (inode_num == -1) {
         printf("错误: 文件 '%s' 不存在\n", filename);
+        pthread_mutex_unlock(&fs_lock);
         return -1;
     }
     
-    // 获取文件inode
-    int inode_num = entries[file_index].inode;
-    int inode_block_index = inode_num / INODES_PER_BLOCK;
-    int inode_offset = inode_num % INODES_PER_BLOCK;
+    // 3. 读取文件inode
+    inode_t file_inode;
+    _read_inode(inode_num, &file_inode);
     
-    char inode_block[BLOCK_SIZE];
-    disk_read_block(INODE_START_BLOCK + inode_block_index, inode_block);
-    inode_t* inodes = (inode_t*)inode_block;
-    inode_t file_inode = inodes[inode_offset];
-    
-    // 释放数据块
+    // 4. 释放数据块
     for (int i = 0; i < 8 && file_inode.blocks[i] != 0; i++) {
         free_block(file_inode.blocks[i]);
     }
     
-    // 释放inode
+    // 5. 释放inode
     free_inode(inode_num);
     
-    // 清除目录项
-    entries[file_index].inode = 0;
-    memset(entries[file_index].name, 0, MAX_FILENAME);
+    // 6. 清除目录项
+    char root_data[BLOCK_SIZE];
+    disk_read_block(root_inode.blocks[0], root_data);
+    dir_entry_t* entries = (dir_entry_t*)root_data;
+    int entry_count = BLOCK_SIZE / sizeof(dir_entry_t);
     
-    // 写回根目录数据块
+    for (int i = 0; i < entry_count; i++) {
+        if (entries[i].inode == inode_num) {
+            entries[i].inode = 0;
+            memset(entries[i].name, 0, MAX_FILENAME);
+            break;
+        }
+    }
+    
+    // 7. 写回根目录数据块
     disk_write_block(root_inode.blocks[0], root_data);
     
     printf("文件 '%s' 删除成功\n", filename);
+    
+    pthread_mutex_unlock(&fs_lock);
     return 0;
 }
 
 /**
- * 列出目录内容
+ * 列出目录内容 (带锁)
  */
 int list_directory() {
+    pthread_mutex_lock(&fs_lock);
+    
     inode_t root_inode;
-    disk_read_block(INODE_START_BLOCK, &root_inode);
+    _read_inode(0, &root_inode);
     
     char root_data[BLOCK_SIZE];
     disk_read_block(root_inode.blocks[0], root_data);
@@ -308,17 +473,9 @@ int list_directory() {
     printf("目录内容:\n");
     int file_count = 0;
     for (int i = 0; i < entry_count; i++) {
-        // 只显示有效的目录项（inode不为0的项）
         if (entries[i].inode != 0) {
-            // 获取文件inode
-            int inode_num = entries[i].inode;
-            int inode_block_index = inode_num / INODES_PER_BLOCK;
-            int inode_offset = inode_num % INODES_PER_BLOCK;
-            
-            char inode_block[BLOCK_SIZE];
-            disk_read_block(INODE_START_BLOCK + inode_block_index, inode_block);
-            inode_t* inodes = (inode_t*)inode_block;
-            inode_t file_inode = inodes[inode_offset];
+            inode_t file_inode;
+            _read_inode(entries[i].inode, &file_inode);
             
             const char* type_str = (file_inode.type == 1) ? "文件" : (file_inode.type == 2) ? "目录" : "未知";
             printf("  %-20s [%s, 大小: %u 字节]\n", entries[i].name, type_str, file_inode.size);
@@ -331,147 +488,164 @@ int list_directory() {
     }
     printf("\n");
     
+    pthread_mutex_unlock(&fs_lock);
     return 0;
 }
 
 /**
- * 读取文件内容
+ * 读取文件内容 (带锁)
  */
 int read_file(const char* filename, char* buffer, size_t size) {
-    // 查找根目录中的文件
+    pthread_mutex_lock(&fs_lock);
+    
+    // 1. 读取根目录inode
     inode_t root_inode;
-    disk_read_block(INODE_START_BLOCK, &root_inode);
+    _read_inode(0, &root_inode);
     
-    char root_data[BLOCK_SIZE];
-    disk_read_block(root_inode.blocks[0], root_data);
-    
-    dir_entry_t* entries = (dir_entry_t*)root_data;
-    int entry_count = BLOCK_SIZE / sizeof(dir_entry_t);
-    int file_index = -1;
-    
-    for (int i = 0; i < entry_count; i++) {
-        if (entries[i].inode != 0 && strcmp(entries[i].name, filename) == 0) {
-            file_index = i;
-            break;
-        }
-    }
-    
-    if (file_index == -1) {
+    // 2. 查找文件inode编号
+    int inode_num = _find_file_inode(filename, &root_inode);
+    if (inode_num == -1) {
         printf("错误: 文件 '%s' 不存在\n", filename);
+        pthread_mutex_unlock(&fs_lock);
         return -1;
     }
     
-    // 获取文件inode
-    int inode_num = entries[file_index].inode;
-    int inode_block_index = inode_num / INODES_PER_BLOCK;
-    int inode_offset = inode_num % INODES_PER_BLOCK;
+    // 3. 读取文件inode
+    inode_t file_inode;
+    _read_inode(inode_num, &file_inode);
     
-    char inode_block[BLOCK_SIZE];
-    disk_read_block(INODE_START_BLOCK + inode_block_index, inode_block);
-    inode_t* inodes = (inode_t*)inode_block;
-    inode_t file_inode = inodes[inode_offset];
+    // 4. 调用内部读取函数
+    int bytes_read = _read_file(inode_num, &file_inode, buffer, size);
     
-    if (file_inode.type != 1) {
-        printf("错误: '%s' 不是一个普通文件\n", filename);
-        return -1;
+    if (bytes_read == -1) {
+         printf("错误: '%s' 不是一个普通文件\n", filename);
     }
     
-    // 读取文件内容
-    size_t bytes_to_read = (size < file_inode.size) ? size : file_inode.size;
-    size_t bytes_read = 0;
-    
-    for (int i = 0; i < 8 && bytes_read < bytes_to_read && file_inode.blocks[i] != 0; i++) {
-        char block_data[BLOCK_SIZE];
-        disk_read_block(file_inode.blocks[i], block_data);
-        
-        size_t block_bytes = (bytes_to_read - bytes_read < BLOCK_SIZE) ? (bytes_to_read - bytes_read) : BLOCK_SIZE;
-        memcpy(buffer + bytes_read, block_data, block_bytes);
-        bytes_read += block_bytes;
-    }
-    
+    pthread_mutex_unlock(&fs_lock);
     return bytes_read;
 }
 
 /**
- * 写入文件内容
+ * 写入文件内容 (带锁)
  */
 int write_file(const char* filename, const char* buffer, size_t size) {
-    // 查找根目录中的文件
+    pthread_mutex_lock(&fs_lock);
+    
+    // 1. 读取根目录inode
     inode_t root_inode;
-    disk_read_block(INODE_START_BLOCK, &root_inode);
+    _read_inode(0, &root_inode);
     
-    char root_data[BLOCK_SIZE];
-    disk_read_block(root_inode.blocks[0], root_data);
-    
-    dir_entry_t* entries = (dir_entry_t*)root_data;
-    int entry_count = BLOCK_SIZE / sizeof(dir_entry_t);
-    int file_index = -1;
-    
-    for (int i = 0; i < entry_count; i++) {
-        if (entries[i].inode != 0 && strcmp(entries[i].name, filename) == 0) {
-            file_index = i;
-            break;
-        }
-    }
-    
-    if (file_index == -1) {
+    // 2. 查找文件inode编号
+    int inode_num = _find_file_inode(filename, &root_inode);
+    if (inode_num == -1) {
         printf("错误: 文件 '%s' 不存在\n", filename);
+        pthread_mutex_unlock(&fs_lock);
         return -1;
     }
     
-    // 获取文件inode
-    int inode_num = entries[file_index].inode;
-    int inode_block_index = inode_num / INODES_PER_BLOCK;
-    int inode_offset = inode_num % INODES_PER_BLOCK;
+    // 3. 读取文件inode
+    inode_t file_inode;
+    _read_inode(inode_num, &file_inode);
     
-    char inode_block[BLOCK_SIZE];
-    disk_read_block(INODE_START_BLOCK + inode_block_index, inode_block);
-    inode_t* inodes = (inode_t*)inode_block;
-    inode_t file_inode = inodes[inode_offset];
-    
-    if (file_inode.type != 1) {
-        printf("错误: '%s' 不是一个普通文件\n", filename);
-        return -1;
+    // 4. 调用内部写入函数
+    int bytes_written = _write_file(inode_num, &file_inode, buffer, size);
+
+    if (bytes_written == -1) {
+         printf("错误: '%s' 不是一个普通文件\n", filename);
+    } else {
+        printf("向文件 '%s' 写入了 %d 字节\n", filename, bytes_written);
     }
     
-    // 释放原有数据块
-    for (int i = 0; i < 8 && file_inode.blocks[i] != 0; i++) {
-        free_block(file_inode.blocks[i]);
-        file_inode.blocks[i] = 0;
-    }
-    
-    // 写入文件内容
-    size_t bytes_written = 0;
-    int block_index = 0;
-    
-    while (bytes_written < size && block_index < 8) {
-        // 分配新的数据块
-        int new_block = alloc_block();
-        if (new_block < 0) {
-            printf("错误: 磁盘空间不足\n");
-            break;
-        }
-        file_inode.blocks[block_index] = new_block;
-        
-        // 准备要写入的数据块
-        char block_data[BLOCK_SIZE] = {0};
-        size_t block_bytes = (size - bytes_written < BLOCK_SIZE) ? (size - bytes_written) : BLOCK_SIZE;
-        memcpy(block_data, buffer + bytes_written, block_bytes);
-        
-        // 写入数据块
-        disk_write_block(file_inode.blocks[block_index], block_data);
-        
-        bytes_written += block_bytes;
-        block_index++;
-    }
-    
-    // 更新文件大小
-    file_inode.size = bytes_written;
-    
-    // 写回inode
-    inodes[inode_offset] = file_inode;
-    disk_write_block(INODE_START_BLOCK + inode_block_index, inode_block);
-    
-    printf("向文件 '%s' 写入了 %zu 字节\n", filename, bytes_written);
+    pthread_mutex_unlock(&fs_lock);
     return bytes_written;
+}
+
+/**
+ * 复制文件 (带锁)
+ */
+int copy_file(const char* src_filename, const char* dest_filename) {
+    pthread_mutex_lock(&fs_lock);
+    
+    int result = -1; // 默认失败
+    char* buffer = NULL;
+
+    // 1. 读取根目录inode
+    inode_t root_inode;
+    _read_inode(0, &root_inode);
+
+    // 2. 检查目标文件是否已存在
+    if (_find_file_inode(dest_filename, &root_inode) != -1) {
+        printf("错误: 目标文件 '%s' 已存在\n", dest_filename);
+        goto cleanup; // 跳转到清理步骤
+    }
+
+    // 3. 查找源文件inode
+    int src_inode_num = _find_file_inode(src_filename, &root_inode);
+    if (src_inode_num == -1) {
+        printf("错误: 源文件 '%s' 不存在\n", src_filename);
+        goto cleanup;
+    }
+
+    // 4. 读取源文件inode
+    inode_t src_inode;
+    _read_inode(src_inode_num, &src_inode);
+
+    if (src_inode.type != 1) {
+        printf("错误: 源 '%s' 不是一个普通文件\n", src_filename);
+        goto cleanup;
+    }
+
+    // 5. 为源文件内容分配缓冲区
+    // 限制：我们的文件系统最多支持 8 * 512 = 4096 字节
+    // 实际项目中，你会动态分配或分块读取
+    size_t max_size = BLOCK_SIZE * 8; 
+    buffer = (char*)malloc(max_size);
+    if (buffer == NULL) {
+        printf("错误: 内存分配失败\n");
+        goto cleanup;
+    }
+
+    // 6. 读取源文件内容
+    int bytes_read = _read_file(src_inode_num, &src_inode, buffer, max_size);
+    if (bytes_read < 0) {
+        printf("错误: 读取源文件 '%s' 失败\n", src_filename);
+        goto cleanup;
+    }
+
+    // 7. 创建目标文件 (内部函数会更新 root_inode)
+    if (_create_file(dest_filename, &root_inode) < 0) {
+        // _create_file 内部会打印错误
+        goto cleanup;
+    }
+
+    // 8. 查找新创建的目标文件的inode
+    int dest_inode_num = _find_file_inode(dest_filename, &root_inode);
+    if (dest_inode_num == -1) {
+        printf("错误: 无法找到新创建的目标文件 '%s'\n", dest_filename);
+        goto cleanup;
+    }
+
+    // 9. 读取目标文件inode
+    inode_t dest_inode;
+    _read_inode(dest_inode_num, &dest_inode);
+
+    // 10. 将缓冲区内容写入目标文件
+    int bytes_written = _write_file(dest_inode_num, &dest_inode, buffer, bytes_read);
+    if (bytes_written != bytes_read) {
+        printf("错误: 写入目标文件 '%s' 失败\n", dest_filename);
+        // 尝试删除不完整的目标文件
+        delete_file(dest_filename);
+        goto cleanup;
+    }
+
+    printf("文件 '%s' 成功复制到 '%s'\n", src_filename, dest_filename);
+    result = 0; // 标记成功
+
+cleanup:
+    // 11. 清理
+    if (buffer != NULL) {
+        free(buffer);
+    }
+    pthread_mutex_unlock(&fs_lock);
+    return result;
 }

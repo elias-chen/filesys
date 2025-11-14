@@ -9,3 +9,7 @@
 
 # 忽略 .exe 文件
 *.exe
+
+# 忽略 .csv .log
+*.csv
+*.log

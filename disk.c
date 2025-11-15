@@ -23,7 +23,7 @@ int disk_init(const char* filename) {
     // 读取超级块
     disk_read_block(SUPERBLOCK_BLOCK, &fs.superblock);
     
-    // 如果是第一次初始化或者魔数不正确，则需要格式化
+    // 通过 flag 来判断是否成功，则需要格式化
     if (fs.superblock.magic != 0x12345678) {
         printf("检测到未初始化的磁盘，执行 format 命令来初始化\n");
     } else {

@@ -12,6 +12,25 @@ typedef struct {
   char name[MAX_FILENAME];
 } dir_entry_t;
 
+// 查找文件并返回其inode编号
+int _find_file_inode(const char *filename, inode_t *root_inode);
+
+// 根据inode编号读取inode结构
+int _read_inode(int inode_num, inode_t *inode_out);
+
+// 根据inode编号写入inode结构
+int _write_inode(int inode_num, inode_t *inode_in);
+
+// 创建文件 (无锁)
+int _create_file(const char *filename, inode_t *root_inode);
+
+// 读取文件逻辑 (无锁)
+int _read_file(int inode_num, inode_t *file_inode, char *buffer, size_t size);
+
+// 写入文件逻辑 (无锁)
+int _write_file(int inode_num, inode_t *file_inode, const char *buffer,
+                size_t size);
+
 // 格式化磁盘，初始化文件系统
 int format_disk();
 
@@ -44,5 +63,11 @@ int write_file(const char *filename, const char *buffer, size_t size);
 
 // 列出目录中的所有文件
 int list_directory();
+
+// 复制文件
+int copy_file(const char *src_filename, const char *dest_filename);
+
+// 初始化文件系统锁
+void init_fs_lock();
 
 #endif

@@ -28,7 +28,7 @@ typedef struct {
 
 // 超级块结构
 typedef struct {
-    uint32_t magic;                    // 文件系统魔数，用于内部验证文件系统类型和完整性
+    uint32_t magic;                    // flag 标识位
     uint32_t blocks;                   // 总块数
     uint32_t inode_blocks;             // inode区占用块数
     uint32_t data_blocks;              // 数据区可用块数

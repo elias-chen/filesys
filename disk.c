@@ -25,8 +25,7 @@ int disk_init(const char* filename) {
     
     // 如果是第一次初始化或者魔数不正确，则需要格式化
     if (fs.superblock.magic != 0x12345678) {
-        printf("检测到未初始化的磁盘，正在格式化...\n");
-        // 这里我们不自动格式化，而是让用户手动执行format命令
+        printf("检测到未初始化的磁盘，请执行 format 命令来手动初始化...\n");
     } else {
         // 读取inode位图
         disk_read_block(INODE_BITMAP_BLOCK, fs.inode_bitmap);

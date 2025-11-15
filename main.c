@@ -1,5 +1,5 @@
 #include <stdio.h>
-#include <stdlib.h>
+// #include <stdlib.h>
 #include <string.h>
 #include <locale.h>
 #include "disk.h"
@@ -19,8 +19,6 @@ void print_help() {
 }
 
 int main() {
-    // 设置本地化以支持中文显示
-    setlocale(LC_ALL, "");
     
     printf("用户态文件系统模拟器\n");
     printf("====================\n");
@@ -79,7 +77,7 @@ int main() {
             if (nargs < 2) {
                 printf("用法: cat <文件名>\n");
             } else {
-                char buffer[BLOCK_SIZE * 8] = {0}; // 最多读取8个块
+                char buffer[BLOCK_SIZE * 8] = {0}; 
                 int bytes_read = read_file(arg, buffer, sizeof(buffer) - 1);
                 if (bytes_read > 0) {
                     buffer[bytes_read] = '\0';
@@ -91,7 +89,7 @@ int main() {
                 printf("用法: echo <文件名>\n");
             } else {
                 printf("请输入要写入的内容 (输入完成后按Enter):\n");
-                // 使用较小的缓冲区并简化输入过程
+
                 char buffer[1024] = {0};
                 if (fgets(buffer, sizeof(buffer), stdin)) {
                     // 移除末尾的换行符

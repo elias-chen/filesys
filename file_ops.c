@@ -59,7 +59,6 @@ int format_disk() {
  */
 int show_disk_info() {
     printf("\n磁盘信息:\n");
-    printf("  魔数: 0x%x\n", fs.superblock.magic);
     printf("  总块数: %u\n", fs.superblock.blocks);
     printf("  Inode区块数: %u\n", fs.superblock.inode_blocks);
     printf("  数据区块数: %u\n", fs.superblock.data_blocks);

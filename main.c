@@ -1,7 +1,7 @@
 #include <stdio.h>
 // #include <stdlib.h>
 #include <string.h>
-#include <locale.h>
+// #include <locale.h>
 #include "disk.h"
 #include "file_ops.h"
 
